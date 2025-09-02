@@ -1,0 +1,1073 @@
+import socket
+import ssl
+import threading
+import queue
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from PIL import Image, ImageTk
+import io
+import os
+import time
+
+
+# --- Optional dependency for audio ---
+try:
+    import pyaudio
+except Exception:
+    pyaudio = None
+
+# ===== Protocol helpers =====
+
+HEADER_LEN = 16  # 6 bytes type + 10 bytes decimal length
+FRAME_MAX = 5 * 1024 * 1024  # 5 MB per frame cap
+
+
+def make_header(kind: str, length: int) -> bytes:
+        kind6 = kind[:6].ljust(6)
+        if length < 0 or length > FRAME_MAX:
+            raise ValueError("Invalid payload length")
+        return (kind6 + f"{length:010d}").encode("ascii")
+
+
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Receive exactly n bytes or return b'' if connection closed."""
+    chunks = []
+    received = 0
+    while received < n:
+        try:
+            chunk = sock.recv(n - received)
+        except (socket.timeout, ssl.SSLWantReadError):
+            continue
+        if not chunk:
+            return b''
+        chunks.append(chunk)
+        received += len(chunk)
+    return b''.join(chunks)
+
+
+def recv_header(sock: socket.socket):
+    """
+    Receive and parse a 16-byte header.
+    Returns (kind, length) or (None, 0) if connection closed.
+    """
+    hdr = recv_exact(sock, HEADER_LEN)
+    if not hdr or len(hdr) != HEADER_LEN:
+        return None, 0
+    kind = hdr[:6].decode("ascii", errors="replace").strip()
+    try:
+        length = int(hdr[6:].decode("ascii"))
+    except ValueError:
+        return None, 0
+    if length < 0 or length > FRAME_MAX:
+        return None, 0
+    return kind, length
+
+
+def get_ipv6_address():
+    hostname = socket.gethostname()
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None, socket.AF_INET6)
+        for addr in addrinfo:
+            ipv6 = addr[4][0]
+            if not ipv6.startswith('fe80'):
+                return ipv6
+    except socket.gaierror:
+        pass
+    return None
+
+
+# ===== TLS helpers =====
+
+def build_server_tls_context(cert_file: str, key_file: str) -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    # Strong ciphers by default; leave defaults
+    return ctx
+
+
+def build_client_tls_context(ca_file: str | None, verify_hostname: bool) -> ssl.SSLContext:
+    if ca_file:
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+        ctx.check_hostname = verify_hostname
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    else:
+        # Insecure mode (self-signed without CA). Allowed but warned in UI.
+        ctx = ssl._create_unverified_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+class ServerThread(threading.Thread):
+    def __init__(self, app, port: int, use_tls: bool, cert_file: str | None, key_file: str | None):
+        super().__init__(daemon=True)
+        self.app = app
+        self.port = port
+        self.server_sock: socket.socket | None = None
+        self.client_conn: ssl.SSLSocket | socket.socket | None = None
+        self._stop_event = threading.Event()
+        self.use_tls = use_tls
+        self.cert_file = cert_file
+        self.key_file = key_file
+        self.tls_ctx: ssl.SSLContext | None = None
+
+    def _close_conn(self):
+        try:
+            if self.client_conn:
+                try:
+                    self.client_conn.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                self.client_conn.close()
+        except Exception:
+            pass
+        self.client_conn = None
+
+    def _close_server(self):
+        try:
+            if self.server_sock:
+                try:
+                    self.server_sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                self.server_sock.close()
+        except Exception:
+            pass
+        self.server_sock = None
+
+    def run(self):
+        try:
+            ip = get_ipv6_address()
+            if not ip:
+                self.app.post_system("❌ Could not find IPv6 address")
+                return
+
+            if self.use_tls:
+                if not (self.cert_file and self.key_file and os.path.exists(self.cert_file) and os.path.exists(self.key_file)):
+                    self.app.post_system("❌ TLS enabled but certificate/key path invalid")
+                    return
+                self.tls_ctx = build_server_tls_context(self.cert_file, self.key_file)
+
+            self.server_sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_sock.bind((ip, self.port))
+            self.server_sock.listen(5)
+            self.app.post_system(f"✅ Server ready on {ip}:{self.port} | Waiting for connection...")
+
+            self.server_sock.settimeout(1.0)
+            while not self._stop_event.is_set():
+                try:
+                    conn, addr = self.server_sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+
+                raw_conn = conn
+                client_ip = addr[0]
+
+                # Optional TLS wrap for the accepted socket (post-accept)
+                if self.use_tls and self.tls_ctx:
+                    try:
+                        conn = self.tls_ctx.wrap_socket(conn, server_side=True)
+                    except Exception as e:
+                        try:
+                            raw_conn.close()
+                        except Exception:
+                            pass
+                        self.app.post_system(f"❌ TLS handshake failed: {e}")
+                        continue
+
+                # Receive client's name|pass (handshake step 1)
+                try:
+                    conn.settimeout(5)
+                    first = conn.recv(1024).decode(errors='replace').strip()
+                except Exception:
+                    conn.close()
+                    continue
+
+                if '|' in first:
+                    client_name, client_pass = first.split('|', 1)
+                else:
+                    client_name, client_pass = first, ''
+
+                # DND check
+                if self.app.dnd_var.get():
+                    try:
+                        conn.sendall(b"Does Not Exist")
+                    except Exception:
+                        pass
+                    conn.close()
+                    self.app.post_system(f"⛔ Connection from {client_name} ({client_ip}) blocked (DND active)")
+                    continue
+
+                # Auth check (server-side passphrase)
+                server_pass = (self.app.pass_var.get() or '').strip()
+                if server_pass and client_pass != server_pass:
+                    try:
+                        conn.sendall(b"Auth Failed")
+                    except Exception:
+                        pass
+                    conn.close()
+                    self.app.post_system(f"⛔ Connection from {client_name} rejected (auth failed)")
+                    continue
+
+                # Ask user to accept connection via non-blocking UI prompt
+                accept = self.app.await_connection_approval(client_name, client_ip)
+                if not accept:
+                    try:
+                        conn.sendall(b"Does Not Exist")
+                    except Exception:
+                        pass
+                    conn.close()
+                    self.app.post_system(f"⛔ Connection from {client_name} rejected")
+                    continue
+
+                # Send acceptance and server's name
+                try:
+                    conn.sendall(f"You Are Connected|{self.app.name_var.get().strip() or 'Server'}".encode())
+                except Exception:
+                    conn.close()
+                    continue
+
+                self.client_conn = conn
+                self.app.set_connected(True)
+                self.app.post_system(f"🔗 Connected to {client_name} ({client_ip})")
+
+                try:
+                    with conn:
+                        conn.settimeout(1.0)
+                        while not self._stop_event.is_set():
+                            kind, length = recv_header(conn)
+                            if kind is None:
+                                break
+
+                            if kind == "TEXT":
+                                data = recv_exact(conn, length)
+                                if not data:
+                                    break
+                                self.app.post_message(data.decode('utf-8', errors='replace'))
+
+                            elif kind == "IMAGE":
+                                img_data = recv_exact(conn, length)
+                                if not img_data:
+                                    break
+                                self.app.post_image(img_data, f"{client_name}")
+
+                            elif kind == "AUDIO":
+                                aud_data = recv_exact(conn, length)
+                                if not aud_data:
+                                    break
+                                self.app.post_audio(aud_data)
+
+                            else:
+                                _ = recv_exact(conn, length)
+                finally:
+                    self.app.post_system("🔌 Connection closed")
+                    self.app.set_connected(False)
+                    self._close_conn()
+        except Exception as e:
+            self.app.post_system(f"❌ Server error: {e}")
+        finally:
+            self._close_conn()
+            self._close_server()
+
+    def send(self, text: str):
+        if self.client_conn:
+            try:
+                payload = text.encode('utf-8')
+                header = make_header("TEXT", len(payload))
+                self.client_conn.sendall(header + payload)
+            except Exception as e:
+                self.app.post_system(f"❌ Send error: {e}")
+
+    def send_image(self, img_data: bytes):
+        if self.client_conn:
+            try:
+                header = make_header("IMAGE", len(img_data))
+                self.client_conn.sendall(header + img_data)
+            except Exception as e:
+                self.app.post_system(f"❌ Image send error: {e}")
+
+    def send_audio(self, aud_data: bytes):
+        if self.client_conn:
+            try:
+                header = make_header("AUDIO", len(aud_data))
+                self.client_conn.sendall(header + aud_data)
+            except Exception as e:
+                self.app.post_system(f"🎧 Audio send error: {e}")
+
+    def stop(self):
+        self._stop_event.set()
+        self._close_conn()
+        self._close_server()
+
+
+class ClientThread(threading.Thread):
+    def __init__(self, app, host: str, port: int, name: str, passphrase: str,
+                 use_tls: bool, ca_file: str | None, verify_hostname: bool):
+        super().__init__(daemon=True)
+        self.app = app
+        self.host = host
+        self.port = port
+        self.name = name
+        self.passphrase = passphrase
+        self.use_tls = use_tls
+        self.ca_file = ca_file
+        self.verify_hostname = verify_hostname
+        self.sock: ssl.SSLSocket | socket.socket | None = None
+        self.server_name = "Server"
+        self._stop_event = threading.Event()
+
+    def _close(self):
+        try:
+            if self.sock:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+
+    def run(self):
+        try:
+            base_sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            base_sock.settimeout(8)
+
+            if self.use_tls:
+                ctx = build_client_tls_context(self.ca_file, self.verify_hostname)
+                try:
+                    self.sock = ctx.wrap_socket(base_sock, server_hostname=self.host if ctx.verify_mode == ssl.CERT_REQUIRED and self.verify_hostname else None)
+                except Exception as e:
+                    self.app.post_system(f"❌ Failed to create TLS socket: {e}")
+                    base_sock.close()
+                    return
+            else:
+                self.sock = base_sock
+
+            try:
+                self.sock.connect((self.host, self.port))
+            except Exception:
+                self.app.post_system("❌ Could not connect to server")
+                self._close()
+                return
+
+            # Send our name|pass to server (handshake step 1)
+            try:
+                first = f"{self.name}|{self.passphrase}".encode()
+                self.sock.sendall(first)
+            except Exception:
+                self.app.post_system("❌ Failed to send name to server")
+                self._close()
+                return
+
+            self.app.post_system("⏳ Waiting for server response...")
+            try:
+                resp = self.sock.recv(1024).decode(errors='replace')
+            except Exception:
+                self.app.post_system("❌ No response from server")
+                self._close()
+                return
+
+            if resp.startswith("Does Not Exist"):
+                self.app.post_system("⛔ Server rejected the request")
+                self._close()
+                return
+
+            if resp.startswith("Auth Failed"):
+                self.app.post_system("⛔ Authentication failed")
+                self._close()
+                return
+
+            if resp.startswith("You Are Connected|"):
+                parts = resp.split("|", 1)
+                if len(parts) == 2:
+                    self.server_name = parts[1]
+            else:
+                self.app.post_system("⚠️ Unknown server response")
+
+            self.app.set_connected(True)
+            self.app.post_system(f"🔗 Connected to server {self.server_name}")
+
+            self.sock.settimeout(1.0)
+            while not self._stop_event.is_set():
+                kind, length = recv_header(self.sock)
+                if kind is None:
+                    break
+
+                if kind == "TEXT":
+                    data = recv_exact(self.sock, length)
+                    if not data:
+                        break
+                    self.app.post_message(data.decode('utf-8', errors='replace'))
+
+                elif kind == "IMAGE":
+                    img_data = recv_exact(self.sock, length)
+                    if not img_data:
+                        break
+                    self.app.post_image(img_data, self.server_name)
+
+                elif kind == "AUDIO":
+                    aud_data = recv_exact(self.sock, length)
+                    if not aud_data:
+                        break
+                    self.app.post_audio(aud_data)
+                else:
+                    _ = recv_exact(self.sock, length)
+
+        except Exception as e:
+            self.app.post_system(f"❌ Client error: {e}")
+        finally:
+            self.app.set_connected(False)
+            self._close()
+            self.app.post_system("🔌 Connection closed")
+
+    def send(self, text: str):
+        if self.sock:
+            try:
+                full = f"{self.name}: {text}"
+                payload = full.encode('utf-8')
+                header = make_header("TEXT", len(payload))
+                self.sock.sendall(header + payload)
+            except Exception as e:
+                self.app.post_system(f"❌ Send error: {e}")
+
+    def send_image(self, img_data: bytes):
+        if self.sock:
+            try:
+                header = make_header("IMAGE", len(img_data))
+                self.sock.sendall(header + img_data)
+            except Exception as e:
+                self.app.post_system(f"❌ Image send error: {e}")
+
+    def send_audio(self, aud_data: bytes):
+        if self.sock:
+            try:
+                header = make_header("AUDIO", len(aud_data))
+                self.sock.sendall(header + aud_data)
+            except Exception as e:
+                self.app.post_system(f"🎧 Audio send error: {e}")
+
+    def stop(self):
+        self._stop_event.set()
+        self._close()
+
+
+# -------- Audio Threads ---------
+
+AUDIO_RATE = 44100
+AUDIO_CHANNELS = 1
+AUDIO_FORMAT = pyaudio.paInt16 if pyaudio else None
+AUDIO_CHUNK = 1024  # frames per buffer (~23ms at 44.1kHz)
+
+
+class AudioSender(threading.Thread):
+    """Continuously records from mic and sends small chunks."""
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self._stop_event = threading.Event()
+        self._p = None
+        self._stream = None
+
+    def run(self):
+        if pyaudio is None:
+            self.app.post_system("❌ PyAudio not installed. Run: pip install pyaudio")
+            return
+        try:
+            self._p = pyaudio.PyAudio()
+            self._stream = self._p.open(format=AUDIO_FORMAT,
+                                        channels=AUDIO_CHANNELS,
+                                        rate=AUDIO_RATE,
+                                        input=True,
+                                        frames_per_buffer=AUDIO_CHUNK)
+            self.app.post_system("🎙️ Mic streaming started")
+            while not self._stop_event.is_set():
+                try:
+                    data = self._stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+                except Exception as e:
+                    self.app.post_system(f"🎤 Mic read error: {e}")
+                    break
+                # Route send through whichever side is active
+                if self.app.mode.get() == 'server' and self.app.server_thread:
+                    self.app.server_thread.send_audio(data)
+                elif self.app.mode.get() == 'client' and self.app.client_thread:
+                    self.app.client_thread.send_audio(data)
+                else:
+                    break
+        finally:
+            try:
+                if self._stream:
+                    self._stream.stop_stream()
+                    self._stream.close()
+            except Exception:
+                pass
+            try:
+                if self._p:
+                    self._p.terminate()
+            except Exception:
+                pass
+            self.app.post_system("🛑 Mic streaming stopped")
+
+    def stop(self):
+        self._stop_event.set()
+
+
+class AudioPlayer(threading.Thread):
+    """Continuously plays received audio chunks from a queue."""
+    def __init__(self, app, data_queue: queue.Queue):
+        super().__init__(daemon=True)
+        self.app = app
+        self.queue = data_queue
+        self._stop_event = threading.Event()
+        self._p = None
+        self._stream = None
+
+    def run(self):
+        if pyaudio is None:
+            self.app.post_system("❌ PyAudio not installed. Cannot play audio.")
+            return
+        try:
+            self._p = pyaudio.PyAudio()
+            self._stream = self._p.open(format=AUDIO_FORMAT,
+                                        channels=AUDIO_CHANNELS,
+                                        rate=AUDIO_RATE,
+                                        output=True,
+                                        frames_per_buffer=AUDIO_CHUNK)
+            self.app.post_system("🔊 Speaker ready")
+            while not self._stop_event.is_set():
+                try:
+                    data = self.queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                try:
+                    self._stream.write(data)
+                except Exception as e:
+                    self.app.post_system(f"🔈 Playback error: {e}")
+                    break
+        finally:
+            try:
+                if self._stream:
+                    self._stream.stop_stream()
+                    self._stream.close()
+            except Exception:
+                pass
+            try:
+                if self._p:
+                    self._p.terminate()
+            except Exception:
+                pass
+            self.app.post_system("🔈 Speaker stopped")
+
+    def stop(self):
+        self._stop_event.set()
+
+
+# -------- GUI App ---------
+
+class ChatApp:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Hash-Chat")
+        self.root.geometry("960x820")
+        self.root.configure(bg="black")
+        self.root.iconbitmap('Hash-Chat.ico')
+        self.green_color = "#00FF7F"
+        self.entry_bg = "#1A1A1A"
+
+        self.mode = tk.StringVar(value="server")
+        self.name_var = tk.StringVar()
+        self.host_var = tk.StringVar()
+        self.port_var = tk.StringVar(value="12345")
+        self.status_var = tk.StringVar(value="—")
+        self.dnd_var = tk.BooleanVar(value=False)
+        self.pass_var = tk.StringVar()  # shared passphrase (server requires, client sends)
+
+        # TLS controls
+        self.use_tls_var = tk.BooleanVar(value=True)
+        self.cert_file_var = tk.StringVar()  # server only
+        self.key_file_var = tk.StringVar()   # server only
+        self.ca_file_var = tk.StringVar()    # client only
+        self.verify_host_var = tk.BooleanVar(value=False)  # client only
+
+        self.connected = False
+
+        self.server_thread: ServerThread | None = None
+        self.client_thread: ClientThread | None = None
+
+        self.ui_queue = queue.Queue()
+
+        # Audio state
+        self.mic_sender: AudioSender | None = None
+        self.mic_on = False
+        self.audio_queue = queue.Queue(maxsize=256)
+        self.audio_player: AudioPlayer | None = None
+
+        # Pending approval dialog state
+        self._approval_result = None
+        self._approval_event = None
+        self._approval_win = None
+
+        self._build_ui()
+        self._poll_ui_queue()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _custom_entry(self, parent, textvariable, width=None):
+        return tk.Entry(
+            parent,
+            textvariable=textvariable,
+            bg=self.entry_bg,
+            fg=self.green_color,
+            insertbackground=self.green_color,
+            highlightthickness=1,
+            highlightcolor=self.green_color,
+            relief="flat",
+            width=width
+        )
+
+    def _browse_file(self, var: tk.StringVar, title: str, filetypes):
+        path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if path:
+            var.set(path)
+
+    def _build_ui(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure(".", background="black", foreground=self.green_color, font=("Consolas", 10))
+        style.configure("TButton", background="black", foreground=self.green_color)
+        style.map("TButton", background=[("active", "#003300")])
+
+        container = ttk.Frame(self.root, padding=8)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        # Top row
+        top = ttk.Frame(container)
+        top.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(top, text="Name:").grid(row=0, column=0)
+        self._custom_entry(top, self.name_var, width=14).grid(row=0, column=1, padx=4)
+
+        mode_frame = ttk.Frame(top)
+        mode_frame.grid(row=0, column=2, padx=8)
+        ttk.Radiobutton(mode_frame, text="Server", value="server", variable=self.mode, command=self._update_mode).pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_frame, text="Client", value="client", variable=self.mode, command=self._update_mode).pack(side=tk.LEFT)
+
+        ttk.Label(top, text="IPv6 Address:").grid(row=0, column=3)
+        self._custom_entry(top, self.host_var, width=28).grid(row=0, column=4, padx=4)
+
+        ttk.Label(top, text="Port:").grid(row=0, column=5)
+        self._custom_entry(top, self.port_var, width=8).grid(row=0, column=6, padx=4)
+
+        self.action_btn = ttk.Button(top, text="Start Server", command=self.toggle_action)
+        self.action_btn.grid(row=0, column=7, padx=8)
+
+        self.dnd_check = ttk.Checkbutton(top, text="Do Not Disturb", variable=self.dnd_var)
+        self.dnd_check.grid(row=0, column=8, padx=4)
+
+        # Auth + TLS row
+        sec = ttk.Frame(container)
+        sec.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(sec, text="Passphrase:").grid(row=0, column=0)
+        self._custom_entry(sec, self.pass_var, width=18).grid(row=0, column=1, padx=4)
+
+        ttk.Checkbutton(sec, text="Use TLS", variable=self.use_tls_var, command=self._update_tls_visibility).grid(row=0, column=2, padx=12)
+
+        # Server TLS
+        self.srv_tls = ttk.Frame(sec)
+        ttk.Label(self.srv_tls, text="Cert:").grid(row=0, column=0)
+        self._custom_entry(self.srv_tls, self.cert_file_var, width=28).grid(row=0, column=1, padx=4)
+        ttk.Button(self.srv_tls, text="…", width=3, command=lambda: self._browse_file(self.cert_file_var, "Select cert.pem", [("PEM", "*.pem"), ("All", "*.*")])).grid(row=0, column=2)
+        ttk.Label(self.srv_tls, text="Key:").grid(row=0, column=3)
+        self._custom_entry(self.srv_tls, self.key_file_var, width=28).grid(row=0, column=4, padx=4)
+        ttk.Button(self.srv_tls, text="…", width=3, command=lambda: self._browse_file(self.key_file_var, "Select key.pem", [("PEM", "*.pem"), ("All", "*.*")])).grid(row=0, column=5)
+
+        # Client TLS
+        self.cli_tls = ttk.Frame(sec)
+        ttk.Label(self.cli_tls, text="CA cert:").grid(row=0, column=0)
+        self._custom_entry(self.cli_tls, self.ca_file_var, width=28).grid(row=0, column=1, padx=4)
+        ttk.Button(self.cli_tls, text="…", width=3, command=lambda: self._browse_file(self.ca_file_var, "Select CA cert", [("PEM", "*.pem"), ("All", "*.*")])).grid(row=0, column=2)
+        ttk.Checkbutton(self.cli_tls, text="Verify hostname", variable=self.verify_host_var).grid(row=0, column=3, padx=8)
+
+        # Status row
+        status = ttk.Frame(container)
+        status.pack(fill=tk.X)
+        ttk.Label(status, text="Status:").pack(side=tk.LEFT)
+        ttk.Label(status, textvariable=self.status_var).pack(side=tk.LEFT, padx=4)
+
+        # Body chat area
+        body = ttk.Frame(container)
+        body.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        self.chat_canvas = tk.Canvas(body, bg="black", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.chat_canvas.yview)
+        self.chat_frame = ttk.Frame(self.chat_canvas)
+
+        self.chat_canvas.configure(yscrollcommand=scrollbar.set)
+        self.chat_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.chat_canvas.create_window((0, 0), window=self.chat_frame, anchor="nw")
+
+        self.chat_frame.bind("<Configure>", lambda e: self.chat_canvas.configure(
+            scrollregion=self.chat_canvas.bbox("all")
+        ))
+
+        def _on_mousewheel(event):
+            self.chat_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        self.chat_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # Send row
+        send = ttk.Frame(container)
+        send.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Button(send, text="📷", width=3, command=self.send_image_dialog).pack(side=tk.LEFT, padx=(0, 4))
+
+        self.msg_var = tk.StringVar()
+        self._custom_entry(send, self.msg_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(send, text="Send", command=self.send_message).pack(side=tk.LEFT, padx=4)
+
+        self.mic_btn = ttk.Button(send, text="🎤 Mic: OFF", command=self.toggle_mic)
+        self.mic_btn.pack(side=tk.LEFT, padx=4)
+
+        local_ip = get_ipv6_address()
+        if local_ip:
+            self.post_system(f"📡 Local IPv6: {local_ip}")
+
+        if pyaudio is None:
+            self.post_system("ℹ️ Audio features need PyAudio. Install with: pip install pyaudio")
+
+        self._update_mode()
+        self._update_tls_visibility()
+
+    def _update_mode(self):
+        if self.mode.get() == 'server':
+            self.action_btn.config(text="Start Server")
+            self.dnd_check.grid()
+            self.srv_tls.grid(row=0, column=3, padx=8)
+            self.cli_tls.grid_forget()
+            if not self.host_var.get():
+                ip = get_ipv6_address()
+                if ip:
+                    self.host_var.set(ip)
+            self.status_var.set("Server Mode")
+        else:
+            self.action_btn.config(text="Connect")
+            self.dnd_check.grid_remove()
+            self.cli_tls.grid(row=0, column=3, padx=8)
+            self.srv_tls.grid_forget()
+            self.status_var.set("Client Mode")
+
+    def _update_tls_visibility(self):
+        use = self.use_tls_var.get()
+        if self.mode.get() == "server":
+            if use:
+                self.srv_tls.grid(row=0, column=3, padx=8)
+            else:
+                self.srv_tls.grid_remove()
+            self.cli_tls.grid_forget()
+        else:
+            if use:
+                self.cli_tls.grid(row=0, column=3, padx=8)
+            else:
+                self.cli_tls.grid_remove()
+            self.srv_tls.grid_forget()
+        if not use:
+            self.post_system("⚠️ TLS disabled (traffic will be plaintext)")
+    def append_text(self, text: str):
+        label = tk.Label(
+            self.chat_frame,
+            text=text,
+            bg="black",
+            fg=self.green_color,
+            font=("Consolas", 10),
+            anchor="w",
+            justify="left",
+            wraplength=860
+        )
+        label.pack(fill=tk.X, padx=2, pady=2)
+        self.chat_canvas.yview_moveto(1.0)
+
+    def append_image(self, img_data: bytes, sender: str):
+        try:
+            img = Image.open(io.BytesIO(img_data))
+            img.thumbnail((480, 480))
+
+            frame = ttk.Frame(self.chat_frame)
+            frame.pack(fill=tk.X, padx=2, pady=5)
+
+            ttk.Label(frame, text=sender, foreground=self.green_color, background="black", font=("Consolas", 8)).pack(anchor="w")
+
+            photo = ImageTk.PhotoImage(img)
+            label = tk.Label(frame, image=photo, bg="black", borderwidth=0)
+            label.image = photo
+            label.pack()
+
+            self.chat_canvas.yview_moveto(1.0)
+        except Exception as e:
+            self.append_text(f"⚠️ Failed to display image: {e}")
+
+    def post_message(self, text: str):
+        self.ui_queue.put(("msg", text))
+
+    def post_image(self, img_data: bytes, sender: str):
+        self.ui_queue.put(("img", (img_data, sender)))
+
+    def post_system(self, text: str):
+        self.ui_queue.put(("sys", text))
+
+    def post_audio(self, aud_bytes: bytes):
+        self.ui_queue.put(("aud", aud_bytes))
+
+    def run_on_ui(self, fn):
+        self.ui_queue.put(("call", fn))
+
+    def _ensure_audio_player(self):
+        if self.audio_player is None or not self.audio_player.is_alive():
+            self.audio_player = AudioPlayer(self, self.audio_queue)
+            self.audio_player.start()
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                kind, payload = self.ui_queue.get_nowait()
+                if kind == "msg":
+                    self.append_text(payload)
+                elif kind == "img":
+                    self.append_image(payload[0], payload[1])
+                elif kind == "sys":
+                    self.append_text(payload)
+                elif kind == "aud":
+                    self._ensure_audio_player()
+                    try:
+                        self.audio_queue.put_nowait(payload)
+                    except queue.Full:
+                        pass
+                elif kind == "call":
+                    try:
+                        payload()
+                    except Exception as e:
+                        self.append_text(f"UI error: {e}")
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(50, self._poll_ui_queue)
+
+    # --- Non-blocking approval dialog ---
+    def await_connection_approval(self, client_name: str, client_ip: str, timeout_sec: int = 30) -> bool:
+        self._approval_event = threading.Event()
+        self._approval_result = False
+
+        def _show_dialog():
+            if self._approval_win and tk.Toplevel.winfo_exists(self._approval_win):
+                try:
+                    self._approval_win.destroy()
+                except Exception:
+                    pass
+            win = tk.Toplevel(self.root)
+            self._approval_win = win
+            win.title("Connection Request")
+            win.configure(bg="black")
+            ttk.Label(win, text=f"Incoming connection from {client_name} ({client_ip})").pack(padx=12, pady=12)
+
+            btns = ttk.Frame(win)
+            btns.pack(pady=8)
+
+            def _accept():
+                self._approval_result = True
+                self._approval_event.set()
+                win.destroy()
+
+            def _reject():
+                self._approval_result = False
+                self._approval_event.set()
+                win.destroy()
+
+            ttk.Button(btns, text="Accept", command=_accept).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btns, text="Reject", command=_reject).pack(side=tk.LEFT, padx=6)
+
+            # auto-close after timeout
+            def _auto_timeout():
+                if not self._approval_event.is_set():
+                    self._approval_result = False
+                    self._approval_event.set()
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+            win.after(timeout_sec * 1000, _auto_timeout)
+
+        self.run_on_ui(_show_dialog)
+        # Wait without blocking UI thread
+        start = time.time()
+        while not self._approval_event.is_set() and (time.time() - start) < (timeout_sec + 1):
+            time.sleep(0.05)
+        return bool(self._approval_result)
+
+    def toggle_action(self):
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            self.post_system("❌ Invalid port number")
+            return
+
+        use_tls = self.use_tls_var.get()
+
+        if self.mode.get() == 'server':
+            if self.server_thread is None:
+                cert_f, key_f = (self.cert_file_var.get().strip() or None, self.key_file_var.get().strip() or None)
+                self.server_thread = ServerThread(self, port, use_tls, cert_f, key_f)
+                self.server_thread.start()
+                self.action_btn.config(text="Stop Server")
+            else:
+                self.server_thread.stop()
+                self.server_thread = None
+                self.action_btn.config(text="Start Server")
+        else:
+            if self.client_thread is None:
+                host = self.host_var.get().strip()
+                name = self.name_var.get().strip() or "User"
+                if not host:
+                    self.post_system("❌ Server address not entered")
+                    return
+                ca_file = self.ca_file_var.get().strip() or None
+                verify_hn = self.verify_host_var.get()
+                if use_tls and not ca_file:
+                    self.post_system("⚠️ TLS without CA cert: certificate will NOT be verified (insecure)")
+                self.client_thread = ClientThread(self, host, port, name, self.pass_var.get().strip(), use_tls, ca_file, verify_hn)
+                self.client_thread.start()
+                self.action_btn.config(text="Disconnect")
+            else:
+                self.client_thread.stop()
+                self.client_thread = None
+                self.action_btn.config(text="Connect")
+
+        # If connection drops, also turn off mic
+        if not self.connected and self.mic_on:
+            self._stop_mic()
+
+    def _prepare_image_bytes(self, filepath: str) -> bytes:
+        # Enforce size cap and recompress if needed
+        try:
+            raw = open(filepath, 'rb').read()
+            if len(raw) <= FRAME_MAX:
+                return raw
+            # Recompress
+            img = Image.open(io.BytesIO(raw)).convert('RGB')
+            img.thumbnail((1280, 1280))
+            out = io.BytesIO()
+            img.save(out, format='JPEG', quality=85, optimize=True)
+            b = out.getvalue()
+            if len(b) > FRAME_MAX:
+                raise ValueError("Image too large even after compression")
+            return b
+        except Exception as e:
+            raise e
+
+    def send_message(self):
+        text = self.msg_var.get().strip()
+        if not text:
+            return
+        if self.mode.get() == 'server' and self.server_thread:
+            msg = f"{self.name_var.get() or 'Server'}: {text}"
+            self.server_thread.send(msg)
+            self.append_text(msg)
+        elif self.mode.get() == 'client' and self.client_thread:
+            self.client_thread.send(text)
+            self.append_text(f"{self.name_var.get() or 'You'}: {text}")
+        else:
+            self.post_system("⚠️ Not connected")
+            return
+        self.msg_var.set("")
+
+    def send_image_dialog(self):
+        if not self.connected:
+            self.post_system("⚠️ Not connected")
+            return
+
+        filepath = filedialog.askopenfilename(
+            title="Select image",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif *.bmp")]
+        )
+        if not filepath:
+            return
+
+        try:
+            img_data = self._prepare_image_bytes(filepath)
+            if self.mode.get() == 'server' and self.server_thread:
+                self.server_thread.send_image(img_data)
+                self.append_text(f"{self.name_var.get() or 'Server'} sent an image")
+            elif self.mode.get() == 'client' and self.client_thread:
+                self.client_thread.send_image(img_data)
+                self.append_text(f"{self.name_var.get() or 'You'} sent an image")
+        except Exception as e:
+            self.post_system(f"❌ Failed to send image: {e}")
+
+    def toggle_mic(self):
+        if not self.connected:
+            self.post_system("⚠️ Not connected")
+            return
+        if pyaudio is None:
+            self.post_system("❌ PyAudio not installed. Install it with: pip install pyaudio")
+            return
+        if not self.mic_on:
+            self._start_mic()
+        else:
+            self._stop_mic()
+
+    def _start_mic(self):
+        if self.mic_sender is None or not self.mic_sender.is_alive():
+            self.mic_sender = AudioSender(self)
+            self.mic_sender.start()
+            self.mic_on = True
+            self.mic_btn.config(text="🎤 Mic: ON")
+        else:
+            self.post_system("🎙️ Mic already on")
+
+    def _stop_mic(self):
+        if self.mic_sender:
+            try:
+                self.mic_sender.stop()
+            except Exception:
+                pass
+            self.mic_sender = None
+        self.mic_on = False
+        self.mic_btn.config(text="🎤 Mic: OFF")
+
+    def set_connected(self, value: bool):
+        self.connected = value
+        if value:
+            self.status_var.set("✅ Connected")
+        else:
+            self._update_mode()
+            if self.mic_on:
+                self._stop_mic()
+
+    def on_close(self):
+        try:
+            if self.server_thread:
+                self.server_thread.stop()
+            if self.client_thread:
+                self.client_thread.stop()
+            if self.mic_sender:
+                self.mic_sender.stop()
+            if self.audio_player:
+                self.audio_player.stop()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    app = ChatApp()
+
+    app.run()
